@@ -4,8 +4,8 @@ from collections import Counter # 用於計算元素出現次數
 import os
 
 # --- 設定檔案路徑 ---
-input_id_map_path = '../maps/tigps_w1_f_id_map.json' # 輸入的家長 id_map 檔案
-output_id_map_path = '../maps/tigps_w1_f_id_map.json' # 輸出的、說明文字唯一的 id_map 檔案
+input_id_map_path = '../maps/tigps_w1_t_id_map.json' # 輸入的家長 id_map 檔案
+output_id_map_path = '../maps/tigps_w1_t_id_map.json' # 輸出的、說明文字唯一的 id_map 檔案
 
 # --- 步驟 1: 讀取原始 id_map ---
 loaded_id_map = None
