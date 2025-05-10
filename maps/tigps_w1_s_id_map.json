@@ -1,10 +1,10 @@
 {
     "qb_code": "題本編號",
     "q_name": "問卷名稱",
-    "nstudent_id": "學生ID",
-    "nschool_id": "學校ID",
+    "nstudent_id": "學生 ID",
+    "nschool_id": "學校 ID",
     "nclass": "班級",
-    "school_class": "學校班級ID",
+    "school_class": "學校班級 ID",
     "school_type": "學校類型",
     "seat_n": "座號",
     "as1": "請問你的性別(生理性別)?",
