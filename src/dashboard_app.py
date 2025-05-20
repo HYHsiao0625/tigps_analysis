@@ -1,542 +1,370 @@
-# -*- coding: utf-8 -*-
-import dash
-from dash import dcc, html
-from dash.dependencies import Input, Output, State
-import plotly.express as px
-import plotly.graph_objects as go
+# src/dashboard_app.py
+
+import streamlit as st
 import pandas as pd
-import json
-import re
 import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scipy.stats as stats
+import os
 
-# ==================================================
-# 前置作業：載入資料與映射字典
-# ==================================================
-data_path = '../data/'
-map_path = '../maps/'
+# --- 0. 基本設定與中文字體 ---
+try:
+    # 嘗試設定多種常見中文字體，增加通用性
+    plt.rcParams['font.sans-serif'] = [
+        'Microsoft JhengHei', 'Arial Unicode MS', 'Microsoft YaHei', 
+        'SimHei', 'PingFang HK', 'Heiti TC', 'sans-serif'
+    ]
+    plt.rcParams['axes.unicode_minus'] = False
+    # st.sidebar.success("已嘗試設定Matplotlib中文字體。") # 稍後在主應用中顯示
+except Exception as e:
+    # st.sidebar.error(f"設定Matplotlib中文字體時發生錯誤: {e}") # 稍後在主應用中顯示
+    pass
 
-def load_csv_data(file_name, file_description):
+# --- 檔案路徑定義 (相對於專案根目錄 tigps_analysis/) ---
+# 假設您是從 tigps_analysis/ 目錄下執行 streamlit run src/dashboard_app.py
+RAW_STUDENT_DATA_PATH = 'data/TIGPSw1_s_descriptive_labeled.csv'
+
+# --- 常量與順序定義 (從分析腳本複製過來) ---
+grouping_col_name = "你上學期的平均成績大約如何?"
+
+# 數值型特徵列表
+numerical_feature_cols_all = [
+    "完成學校功課(查找完成作業需要的資料)",  # as35a
+    "課外的學習(各種線上付費或免費的課程)"   # as35b
+]
+# 類別型特徵列表
+categorical_feature_cols_all = [
+    "電腦(含桌機或筆電)",                         # as56a
+    "智慧型手機",                                 # as56b
+    "平板或電子書閱讀器(iPad, Kindle...)",        # as56d
+    "讀書或寫作業時,我會先將無關的網站、即時通訊、手機APP或提醒聲音關掉", # as59a
+    "我能要求自己先完成作業或讀書進度後,才能去看我喜歡的網站或玩手機。",       # as59b
+    "我會運用學習平台上的儀表板,了解自己的認真或表現情況(...)",             # as59c
+    "我會運用學習平台以外的軟體(如:Google日曆、Forrest、Notion、Anki等),安排我的學習進度。", # as59d
+    "我喜歡學校。",                                 # as14a
+    "你跟得上學校課業進度嗎?"                       # as19
+]
+
+all_selected_cols_for_processing = [grouping_col_name] + numerical_feature_cols_all + categorical_feature_cols_all
+
+# 順序定義
+grade_order = ['全班五名以內', '全班六至十名', '全班十一至二十名', '全班二十一至三十名', '全班三十名以後']
+time_mapping = { "沒有": 0.0, "0.5小時以內": 0.25, "0.5-1小時": 0.75, "1-1.5小時": 1.25, "1.5-2小時": 1.75, "2-2.5小時": 2.25, "2.5-3小時": 2.75, "3-3.5小時": 3.25, "3.5-4小時": 3.75, "4-4.5小時": 4.25, "4.5-5小時": 4.75, "5小時以上": 5.5 }
+values_to_replace_time = ["此卷未答", "跳答", "系統遺漏值"]
+comp_freq_order = ['幾乎每天', '每週三四次', '每週一兩次', '每月三四次', '每月一兩次', '一年幾次', '幾乎沒有', '沒有這項設備']
+values_to_replace_freq = ["此卷未答", "系統遺漏值"]
+agreement_order_s59 = ['很符合', '符合', '不符合', '很不符合']
+values_to_replace_manage = ["系統遺漏值", "此卷未答"] # 通用遺失值
+agreement_order_s14a = ['很同意', '同意', '不同意', '很不同意']
+progress_order_s19 = ['我的進度超前', '大部分都跟得上', '只落後一點點,很快就跟上了', '我有點落後,可能跟得上', '我落後很多,很難跟得上']
+
+category_orders_map = {
+    "電腦(含桌機或筆電)": comp_freq_order, "智慧型手機": comp_freq_order, "平板或電子書閱讀器(iPad, Kindle...)": comp_freq_order,
+    "讀書或寫作業時,我會先將無關的網站、即時通訊、手機APP或提醒聲音關掉": agreement_order_s59,
+    "我能要求自己先完成作業或讀書進度後,才能去看我喜歡的網站或玩手機。": agreement_order_s59,
+    "我會運用學習平台上的儀表板,了解自己的認真或表現情況(...)": agreement_order_s59,
+    "我會運用學習平台以外的軟體(如:Google日曆、Forrest、Notion、Anki等),安排我的學習進度。": agreement_order_s59,
+    "我喜歡學校。": agreement_order_s14a, "你跟得上學校課業進度嗎?": progress_order_s19
+}
+palettes_for_categorical = ["muted", "pastel", "deep", "colorblind", "bright", "tab10"] # Corrected here
+
+
+# --- 1. 數據載入與預處理函數 ---
+@st.cache_data # Streamlit 快取機制，加速數據載入和預處理
+def load_and_preprocess_data(raw_file_path):
     try:
-        df = pd.read_csv(f"{data_path}{file_name}", low_memory=False)
-        print(f"已成功載入{file_description}: {file_name}")
-        return df
+        df_raw = pd.read_csv(raw_file_path, low_memory=False)
+        st.sidebar.success(f"成功從 {raw_file_path} 載入原始數據。")
     except FileNotFoundError:
-        print(f"錯誤：找不到{file_description} '{data_path}{file_name}'。將使用空 DataFrame。")
-        return pd.DataFrame()
+        st.error(f"錯誤：找不到原始數據檔案 {raw_file_path}。請確保檔案路徑正確。")
+        return None
 
-def load_json_map(file_name, map_description, is_value_map=False):
-    try:
-        with open(f"{map_path}{file_name}", 'r', encoding='utf-8-sig') as f: data = json.load(f)
-        print(f"已成功載入{map_description}: {file_name}")
-        if is_value_map: return data.get("value_maps", {}), data.get("general_options", {})
-        return data
-    except FileNotFoundError: print(f"警告：找不到{map_description} '{map_path}{file_name}'。"); return ({}, {}) if is_value_map else {}
-    except json.JSONDecodeError: print(f"錯誤：解析{map_description} '{map_path}{file_name}' 時發生錯誤。"); return ({}, {}) if is_value_map else {}
-
-df_s = load_csv_data('TIGPSw1_s_descriptive_labeled.csv', '學生問卷資料')
-df_p = load_csv_data('TIGPSw1_p_descriptive_labeled.csv', '家長問卷資料')
-df_t = load_csv_data('TIGPSw1_t_descriptive_labeled.csv', '導師問卷資料')
-df_st = load_csv_data('TIGPSw1_st_descriptive_labeled.csv', '科任教師問卷資料')
-df_sc = load_csv_data('TIGPSw1_sc_descriptive_labeled.csv', '學校問卷資料')
+    st.sidebar.info("正在進行數據預處理...")
+    # 確保只選取我們定義好的欄位，避免潛在的额外欄位問題
+    cols_to_select_initially = [col for col in all_selected_cols_for_processing if col in df_raw.columns]
+    if len(cols_to_select_initially) != len(all_selected_cols_for_processing):
+        st.sidebar.warning("部分定義的欄位在原始數據中缺失，將只處理存在的欄位。")
+        missing_cols_in_raw = [col for col in all_selected_cols_for_processing if col not in df_raw.columns]
+        st.sidebar.json({"定義的欄位但原始數據中缺失": missing_cols_in_raw})
 
 
-# --- 資料合併 (範例，請根據您的實際需求和欄位名進行調整) ---
-df_merged_s_t_st = df_s.copy() if not df_s.empty else pd.DataFrame()
-if not df_t.empty and '學校班級 ID' in df_t.columns and '學校班級 ID' in df_merged_s_t_st.columns:
-    df_merged_s_t_st = pd.merge(df_merged_s_t_st, df_t, on='學校班級 ID', how='left')
-    print("學生資料與導師資料合併完成。")
+    df_processed = df_raw[cols_to_select_initially].copy()
 
-if not df_st.empty and '學校班級 ID' in df_st.columns and '學校班級 ID' in df_merged_s_t_st.columns:
-    df_merged_s_t_st = pd.merge(df_merged_s_t_st, df_st, on='學校班級 ID', how='left', suffixes=('', '_st_dup')) # 處理可能的後續衝突
-    print("合併後的資料與科任老師資料再次合併完成。")
+    # A. 處理分群變項
+    if grouping_col_name in df_processed.columns:
+        df_processed[grouping_col_name] = df_processed[grouping_col_name].replace(["系統遺漏值", "此卷未答", "我不知道"], np.nan)
+        grade_dtype = pd.CategoricalDtype(categories=grade_order, ordered=True)
+        df_processed[grouping_col_name] = df_processed[grouping_col_name].astype(grade_dtype)
 
-df_merged_s_p_sc = df_s.copy() if not df_s.empty else pd.DataFrame()
-if not df_p.empty and '學生 ID' in df_p.columns and '學生 ID' in df_merged_s_p_sc.columns:
-    df_merged_s_p_sc = pd.merge(df_merged_s_p_sc, df_p, on='學生 ID', how='left')
-    print(df_merged_s_p_sc.columns)
-    print("學生資料與家長資料合併完成。")
-if not df_sc.empty and '學校 ID' in df_sc.columns and '學校 ID_x' in df_merged_s_p_sc.columns:
-    df_sc_prefixed = df_sc.rename(columns=lambda c: f"{c}_x" if c == '學校 ID' else c)
-    print(df_sc_prefixed.columns)
-    print(df_merged_s_p_sc.columns)
-    df_merged_s_p_sc = pd.merge(df_merged_s_p_sc, df_sc_prefixed, on='學校 ID_x', how='left')
-    print("合併後的資料與學校資料再次合併完成。")
+    # B. 處理時間型數值特徵
+    for col in numerical_feature_cols_all:
+        if col in df_processed.columns:
+            df_processed[col] = df_processed[col].replace(values_to_replace_time, np.nan)
+            mapped_col = df_processed[col].map(time_mapping)
+            # combine_first 用於保留那些不在 mapping 中的值 (例如已經是 NaN 的)
+            df_processed[col] = mapped_col.combine_first(df_processed[col])
+            df_processed[col] = pd.to_numeric(df_processed[col], errors='coerce')
 
-# --- 載入並合併映射表 ---
-id_map_s = load_json_map('tigps_w1_s_id_map.json', '學生問卷ID Map')
-value_map_s, general_options_s = load_json_map('tigps_w1_s_value_maps.json', '學生問卷Value Map', is_value_map=True)
-id_map_t = load_json_map('tigps_w1_t_id_map.json', '導師問卷ID Map')
-value_map_t, _ = load_json_map('tigps_w1_t_value_maps.json', '導師問卷Value Map', is_value_map=True)
-id_map_p = load_json_map('tigps_w1_p_id_map.json', '家長問卷ID Map')
-value_map_p, _ = load_json_map('tigps_w1_p_value_maps.json', '家長問卷Value Map', is_value_map=True)
-id_map_st = load_json_map('tigps_w1_st_id_map.json', '科任教師問卷ID Map')
-value_map_st, _ = load_json_map('tigps_w1_st_value_maps.json', '科任教師問卷Value Map', is_value_map=True)
-id_map_sc = load_json_map('tigps_w1_sc_id_map.json', '學校問卷ID Map')
-value_map_sc, _ = load_json_map('tigps_w1_sc_value_maps.json', '學校問卷Value Map', is_value_map=True)
-
-master_id_map = {}
-master_id_map.update(id_map_s)
-master_id_map.update(id_map_t)
-master_id_map.update(id_map_p)
-master_id_map.update(id_map_st)
-master_id_map.update(id_map_sc)
-# for k, v in id_map_t.items(): master_id_map[f"t_{k}"] = v # 導師變項加 t_ 前綴
-# for k, v in id_map_p.items(): master_id_map[f"p_{k}"] = v # 家長變項加 p_ 前綴
-# for k, v in id_map_st.items(): master_id_map[f"st_{k}"] = v # 科任變項加 st_ 前綴
-# for k, v in id_map_sc.items(): master_id_map[f"sc_{k}"] = v # 學校變項加 sc_ 前綴
-
-master_value_map = {}
-master_value_map.update(value_map_s)
-master_value_map.update(value_map_t)
-master_value_map.update(value_map_p)
-master_value_map.update(value_map_st)
-master_value_map.update(value_map_sc)
-# for k, v in value_map_t.items(): master_value_map[f"t_{k}"] = v
-# for k, v in value_map_p.items(): master_value_map[f"p_{k}"] = v
-# for k, v in value_map_st.items(): master_value_map[f"st_{k}"] = v
-# for k, v in value_map_sc.items(): master_value_map[f"sc_{k}"] = v
-
-values_to_exclude = ["不適用", "跳答", "不知道、不清楚、忘記了", "拒答", "我不清楚", "系統遺漏值", "無意義作答/邏輯矛盾", "此卷未答"]
-if general_options_s: # 假設通用排除項主要來自學生問卷
-    for code, label in general_options_s.items():
-        try:
-            if int(code) < 0 and label not in values_to_exclude: values_to_exclude.append(label)
-        except ValueError: pass
-values_to_exclude = list(set(values_to_exclude))
-print(f"將從分析中排除以下標籤: {values_to_exclude}")
-
-# ==================================================
-# 輔助函數定義 (使用 master_id_map 和 master_value_map)
-# ==================================================
-def get_option_order(variable_code_with_prefix):
-    options = master_value_map.get(variable_code_with_prefix, {})
-    if not options: return []
-    sorted_items = []
-    try:
-        numeric_keys = [(float(k), v) for k, v in options.items()]
-        sorted_items = sorted(numeric_keys)
-    except (ValueError, TypeError):
-         try: return sorted([v for v in options.values() if v not in values_to_exclude])
-         except TypeError: return [v for v in list(options.values()) if v not in values_to_exclude]
-    return [label for val, label in sorted_items if label not in values_to_exclude]
-
-def get_label_to_score_map(variable_code_with_prefix, reverse_score=False):
-    options = master_value_map.get(variable_code_with_prefix, {})
-    if not options: return None
-    valid_options = {k: v for k, v in options.items() if v not in values_to_exclude}
-    if not valid_options: return None
-    sorted_items = []
-    try:
-        numeric_keys = [(float(k), v) for k, v in valid_options.items()]
-        sorted_items = sorted(numeric_keys)
-    except (ValueError, TypeError):
-         print(f"警告(輔助函數)：變項 {variable_code_with_prefix} 的有效選項鍵無法轉為數值排序。")
-         return None
-    score_map = {}
-    num_options = len(sorted_items)
-    for i, (original_value, label) in enumerate(sorted_items):
-        score = (num_options - i) if reverse_score else (i + 1)
-        score_map[label] = score
-    return score_map
-
-# ==================================================
-# Dash App 初始化
-# ==================================================
-app = dash.Dash(__name__, suppress_callback_exceptions=True)
-server = app.server
-
-# ==================================================
-# 為每個目標定義 custom_topics (使用您提供的版本)
-# 變項代碼需與合併後 DataFrame 中的欄位名一致 (可能包含前綴)
-# ==================================================
-# --- 目標一 (學生變項，假設無前綴或 's_' 前綴已在 df_s 欄位名中) ---
-custom_topics_target1 = {
-    "主題: 數位學習行為": ['as35a', 'as35b', 'as56a', 'as56b', 'as56d', 'as59a', 'as59b', 'as59c', 'as59d'],
-    "主題: 數位素養": ['as60a', 'as60b', 'as60c', 'as61a', 'as61b', 'as61c', 'as61d', 'as61e', 'as61f', 'as61g', 'as61h', 'as61i'],
-    "主題: 學習動機/興趣 (代理)": ['as14a', 'as19'],
-    "主題: 學業表現 (代理)": ['as20'],
-    "主題: 上網時間分配": ['as35a', 'as35b', 'as35c', 'as35d', 'as35e', 'as35f'],
-    "主題: 網路沉迷風險": ['as41a', 'as41b', 'as41c', 'as41d', 'as41e', 'as41f', 'as41g', 'as41h', 'as41i', 'as41j'],
-}
-
-# --- 目標二 (假設導師變項前綴 't_', 科任 'st_', 學生無前綴或 's_') ---
-custom_topics_target2 = {
-    "主題: 導師-媒體科技使用情形": ['at27a', 'at27b', 'at27c', 'at27d', 'at27e', 'at27f', 'at27g'],
-    "主題: 導師-數位教學實踐與信念": ['at29a', 'at29b', 'at29c', 'at29d', 'at29e', 'at29f', 'at29g', 'at29h', 'at29i', 'at29j', 'at29k', 'at29l', 'at29m', 'at29n', 'at29o', 'at29p', 'at29q', 'at29r', 'at29s', 'at29t', 'at29u', 'at29v', 'at29w', 'at29x' ],
-    "主題: 導師-數位教學與儀表板使用時數": ['at34', 'at35', 'at36'],
-    "主題: 導師-教學阻礙因素": ['at43a', 'at43b', 'at43c', 'at43d', 'at43e', 'at43f', 'at43g'],
-    "主題: 科任-教學阻礙因素": ['atsub1', 'atsub2', 'atsub3', 'atsub4', 'atsub5', 'atsub6', 'atsub7'],
-    "主題: 科任-媒體科技使用情形(共同)": ['at27a', 'at27b', 'at27c', 'at27d', 'at27e', 'at27f', 'at27g'], # 假設科任共同題變項名與導師不同 (例如 at27a)
-    "主題: 科任-數位教學實踐與信念(共同)": ['at29a', 'at29x'], # 簡化
-    "主題: 學生感知-課業進度感受": ['as19'],
-    "主題: 學生感知-上網做功課時間": ['as35a'],
-    "主題: 學生感知-喜歡學校程度": ['as14a']
-}
-
-# --- 目標三 ---
-custom_topics_target3 = {
-    "主題: 數位資源品質-學生報告": ['as57a', 'as57b', 'as57c', 'as57d'],
-    "主題: 數位資源品質-家中上網方式(家長)": ['ap52_1', 'ap52_2', 'ap52_3', 'ap52_4', 'ap52_5', 'ap52_6', 'ap52_7'],
-    "主題: 數位資源品質-家中設備數量(家長)": ['ap49a', 'ap49b', 'ap49c', 'ap49d', 'ap49e', 'ap49f', 'ap49g', 'ap49h'],
-    "主題: 使用模式-學習相關時間(學生)": ['as35a', 'as35b'],
-    "主題: 使用模式-娛樂相關時間(學生)": ['as35c', 'as35d', 'as35e'],
-    "主題: 家庭SES-家長教育程度（學生）": ['as4d1', 'as4d2'],
-    "主題: 家庭SES-家長教育程度（家長）": ['ap5'],
-    "主題: 家庭SES-自評家境（學生）": ['as10'],
-    "主題: 家庭SES-自評家境（家長）": ['ap20'],
-    "主題: 家庭SES-家長職業(家長)": ['ap92', 'ap104'],
-    "主題: 學習投入/表現(學生)": ['as35a', 'as35b', 'as20'],
-    "主題: 學校支持-課程與管理": ['asc14', 'asc15', 'asc25k'],
-    "主題: 學校支持-弱勢與設施": ['asc24j', 'asc25d', 'asc25e', 'asc25l', 'asc25m'],
-}
-
-# --- 目標四 (學生變項) ---
-custom_topics_target4 = {
-    "主題: 數位福祉-網路社交壓力(FoMO)": ['as39a', 'as39b', 'as39c', 'as39d'],
-    "主題: 數位福祉-社會比較": ['as40a', 'as40b', 'as40c', 'as40d', 'as40e', 'as40f'],
-    "主題: 數位福祉-螢幕使用時間": ['as35a', 'as35b', 'as35c', 'as35d', 'as35e', 'as35f'],
-    "主題: 數位福祉-網路成癮傾向": ['as41a', 'as41b', 'as41c', 'as41d', 'as41e', 'as41f', 'as41g', 'as41h', 'as41i', 'as41j'],
-    "主題: 網路霸凌經驗-被霸凌(是否與形式)": ['as53', 'as53a1', 'as53a2', 'as53a3', 'as53a4', 'as53a5', 'as53a6', 'as53a7', 'as53a8'],
-    "主題: 網路霸凌經驗-霸凌他人(是否與形式)": ['as54', 'as54a1', 'as54a2', 'as54a3', 'as54a4', 'as54a5', 'as54a6', 'as54a7', 'as54a8'],
-    "主題: 校園適應-同儕關係品質": ['as42a', 'as42b', 'as42c', 'as42d', 'as42e', 'as16a', 'as16b', 'as16c', 'as16d', 'as16e'],
-    "主題: 校園適應-校園歸屬感": ['as14a', 'as14b', 'as14c'],
-    "主題: 校園適應-學業壓力感受": ['as72k', 'as72l', 'as21'],
-    "主題: 校園適應-整體幸福感": ['as62', 'as63', 'as65a', 'as65b', 'as65c'],
-}
-
-# --- 集中管理所有目標的定義 ---
-target_definitions = {
-    "目標一：學生數位學習與學業": {
-        "topics": custom_topics_target1,
-        "df_name": "df_s", # 主要使用學生原始資料
-        "id_map_obj": master_id_map, # 使用合併後的 master map
-        "value_map_obj": master_value_map,
-    },
-    "目標二：教師科技融入與學生經驗": {
-        "topics": custom_topics_target2,
-        "df_name": "df_merged_s_t_st", # 應指向您合併學生、導師、科任後的 DataFrame
-        "id_map_obj": master_id_map,
-        "value_map_obj": master_value_map,
-    },
-    "目標三：數位資源差異與學習機會": {
-        "topics": custom_topics_target3,
-        "df_name": "df_merged_s_p_sc", # 應指向您合併學生、家長、學校後的 DataFrame
-        "id_map_obj": master_id_map,
-        "value_map_obj": master_value_map,
-    },
-    "目標四：數位福祉與校園適應": {
-        "topics": custom_topics_target4,
-        "df_name": "df_s",
-        "id_map_obj": master_id_map,
-        "value_map_obj": master_value_map,
-    },
-}
-
-# 為每個 custom_topics 補充 "主題: 所有可分析變項"
-for target_name, definition in target_definitions.items():
-    all_vars_in_target = []
-    for topic_vars in definition['topics'].values():
-        all_vars_in_target.extend(topic_vars)
-    definition['topics']["主題: 所有可分析變項"] = sorted(list(set(all_vars_in_target)))
-
-
-# --- 準備目標選擇器的選項 ---
-target_selector_options = [{'label': name, 'value': name} for name in target_definitions.keys()]
-initial_target = target_selector_options[0]['value'] if target_selector_options else None
-
-# ==================================================
-# App Layout 定義 (與前一版本相同)
-# ==================================================
-app.layout = html.Div([
-    html.H1("TIGPS 資料探索儀表板"),
-    html.Div([
-        html.Label("選擇研究目標:", style={'fontWeight': 'bold'}),
-        dcc.RadioItems(
-            id='target-selector-radio',
-            options=target_selector_options,
-            value=initial_target,
-            labelStyle={'display': 'block', 'marginBottom': '5px'}
-        ),
-    ], style={'marginBottom': 20, 'padding': '15px', 'border': '1px solid #ccc', 'borderRadius': '5px'}),
-    html.Hr(),
-    html.Div([
-        html.Label("選擇分析類型:", style={'fontWeight': 'bold'}),
-        dcc.RadioItems( id='analysis-type-radio',
-           options=[ {'label': '主題/題組描述', 'value': 'describe_group'},
-                     {'label': '雙變項關聯', 'value': 'relate'} ],
-            value='describe_group', labelStyle={'display': 'inline-block', 'marginRight': '20px'}
-        ),
-    ], style={'marginBottom': 20, 'borderBottom': '1px solid #eee', 'paddingBottom': '10px'}),
-    html.Div(id='controls-area', children=[], style={'padding': '20px', 'border': '1px solid #ddd', 'borderRadius': '5px', 'backgroundColor': '#f9f9f9', 'marginBottom': '20px'}),
-    html.Hr(),
-    html.Div([
-        html.H3("分析結果:", style={'marginBottom': '10px'}),
-        html.Div(id='describe-output-container'),
-        html.Div(id='relate-output-container', children=[
-             html.Div(id='stats-output-relate', style={'whiteSpace': 'pre-wrap', 'fontFamily': 'monospace', 'border': '1px solid #eee', 'padding': '10px', 'marginBottom': '20px', 'backgroundColor': '#fafafa'}),
-             dcc.Graph(id='plot-output-relate', figure=go.Figure())
-        ], style={'display': 'none'})
-    ])
-])
-
-# ==================================================
-# Callbacks 定義 (與前一版本相同，核心邏輯不變)
-# ==================================================
-
-# --- Callback A: 更新控制項區域佈局 ---
-@app.callback(
-    Output('controls-area', 'children'),
-    Input('target-selector-radio', 'value')
-)
-def update_controls_area_layout(selected_target_name):
-    if not selected_target_name or selected_target_name not in target_definitions:
-        return html.P("請先選擇一個研究目標。")
-
-    target_info = target_definitions[selected_target_name]
-    current_target_topics = target_info['topics']
-    active_id_map_for_dropdowns = target_info['id_map_obj'] # 使用 master_id_map
-    current_df_name = target_info['df_name']
-    current_df = globals().get(current_df_name, pd.DataFrame())
-
-    current_topic_group_options = [{'label': name, 'value': name} for name in sorted(current_target_topics.keys())]
-    initial_topic_for_target = current_topic_group_options[0]['value'] if current_topic_group_options else None
-
-    default_topic_key_for_relate = "主題: 所有可分析變項" # 使用新的通用主題名
-    if default_topic_key_for_relate not in current_target_topics and current_topic_group_options:
-        default_topic_key_for_relate = current_topic_group_options[0]['value']
+    # C. 處理設備使用頻率類別特徵
+    freq_cols_to_process = ["電腦(含桌機或筆電)", "智慧型手機", "平板或電子書閱讀器(iPad, Kindle...)"]
+    for col in freq_cols_to_process:
+        if col in df_processed.columns:
+            df_processed[col] = df_processed[col].replace(values_to_replace_freq, np.nan)
+            comp_freq_dtype = pd.CategoricalDtype(categories=comp_freq_order, ordered=True)
+            df_processed[col] = df_processed[col].astype(comp_freq_dtype)
     
-    default_codes_for_relate = current_target_topics.get(default_topic_key_for_relate, [])
+    # D. 處理線上學習自我管理類別特徵 (as59系列)
+    s59_cols_to_process = [
+        "讀書或寫作業時,我會先將無關的網站、即時通訊、手機APP或提醒聲音關掉",
+        "我能要求自己先完成作業或讀書進度後,才能去看我喜歡的網站或玩手機。",
+        "我會運用學習平台上的儀表板,了解自己的認真或表現情況(...)",
+        "我會運用學習平台以外的軟體(如:Google日曆、Forrest、Notion、Anki等),安排我的學習進度。"
+    ]
+    for col in s59_cols_to_process:
+         if col in df_processed.columns:
+            df_processed[col] = df_processed[col].replace(values_to_replace_manage, np.nan)
+            agreement_dtype_s59 = pd.CategoricalDtype(categories=agreement_order_s59, ordered=True)
+            df_processed[col] = df_processed[col].astype(agreement_dtype_s59)
 
-    initial_relate_var_options = []
-    if not current_df.empty:
-        initial_relate_var_options = [{'label': f"{active_id_map_for_dropdowns.get(code, code)} ({code})", 'value': code}
-                                      for code in default_codes_for_relate
-                                      if code in active_id_map_for_dropdowns and active_id_map_for_dropdowns.get(code,code) in current_df.columns]
+    # E. 處理 "我喜歡學校。" (as14a)
+    col_as14a = "我喜歡學校。"
+    if col_as14a in df_processed.columns:
+        df_processed[col_as14a] = df_processed[col_as14a].replace(values_to_replace_manage, np.nan)
+        agreement_dtype_s14a = pd.CategoricalDtype(categories=agreement_order_s14a, ordered=True)
+        df_processed[col_as14a] = df_processed[col_as14a].astype(agreement_dtype_s14a)
 
-    initial_relate_x_val = initial_relate_var_options[0]['value'] if initial_relate_var_options else None
-    initial_relate_y_val = initial_relate_var_options[1]['value'] if len(initial_relate_var_options) > 1 else (initial_relate_var_options[0]['value'] if initial_relate_var_options else None)
+    # F. 處理 "你跟得上學校課業進度嗎?" (as19)
+    col_as19 = "你跟得上學校課業進度嗎?"
+    if col_as19 in df_processed.columns:
+        df_processed[col_as19] = df_processed[col_as19].replace(values_to_replace_manage, np.nan)
+        progress_dtype_s19 = pd.CategoricalDtype(categories=progress_order_s19, ordered=True)
+        df_processed[col_as19] = df_processed[col_as19].astype(progress_dtype_s19)
     
-    describe_controls = html.Div(id='describe-group-controls', children=[
-        html.Label("1. 選擇要描述的主題/題組:", style={'fontWeight': 'bold'}),
-        dcc.Dropdown(id='topic-group-dropdown', options=current_topic_group_options, value=initial_topic_for_target, clearable=False),
-        html.Label("2. (可選) 過濾顯示的子項目:", style={'fontWeight': 'bold', 'marginTop': '10px'}),
-        dcc.Dropdown(id='variable-filter-multiselect', options=[], value=[], multi=True)
-    ])
-    relate_controls = html.Div(id='relate-controls', children=[
-        html.Div([
-             html.Label("1. 選擇 X 軸 主題/題組:", style={'fontWeight': 'bold'}),
-             dcc.Dropdown(id='topic-group-dropdown-x', options=current_topic_group_options, value=default_topic_key_for_relate if default_topic_key_for_relate in current_target_topics else initial_topic_for_target, clearable=False),
-             html.Label("2. 選擇 X 軸 變項:", style={'fontWeight': 'bold', 'marginTop': '5px'}),
-             dcc.Dropdown(id='relate-x-dropdown', options=initial_relate_var_options, value=initial_relate_x_val, clearable=False)
-        ], style={'width': '48%', 'display': 'inline-block', 'verticalAlign': 'top', 'marginRight': '2%'}),
-        html.Div([
-            html.Label("3. 選擇 Y 軸 主題/題組:", style={'fontWeight': 'bold'}),
-            dcc.Dropdown(id='topic-group-dropdown-y', options=current_topic_group_options, value=default_topic_key_for_relate if default_topic_key_for_relate in current_target_topics else initial_topic_for_target, clearable=False),
-            html.Label("4. 選擇 Y 軸 變項:", style={'fontWeight': 'bold', 'marginTop': '5px'}),
-            dcc.Dropdown(id='relate-y-dropdown', options=initial_relate_var_options, value=initial_relate_y_val, clearable=False)
-        ], style={'width': '48%', 'display': 'inline-block', 'verticalAlign': 'top', 'float': 'right'}),
-        html.Div([
-            html.Label("5. 選擇圖表類型:", style={'fontWeight': 'bold', 'marginTop': '15px'}),
-            dcc.RadioItems( id='relate-plot-type',
-               options=[ {'label': '盒鬚圖 (Y軸需轉分數)', 'value': 'boxplot'},
-                         {'label': '交叉表熱圖 (百分比)', 'value': 'heatmap'},
-                         {'label': '堆疊長條圖 (次數)', 'value': 'stackedbar'}],
-                value='boxplot', labelStyle={'display': 'inline-block', 'marginRight': '20px'} )
-        ], style={'clear': 'both', 'paddingTop': '15px'})
-    ])
-    return [describe_controls, relate_controls]
+    st.sidebar.success("數據預處理完畢。")
+    return df_processed
 
-# --- Callback 1: 根據分析類型顯示/隱藏控制項和輸出區域 ---
-@app.callback(
-    Output('describe-group-controls', 'style', allow_duplicate=True), Output('relate-controls', 'style', allow_duplicate=True),
-    Output('describe-output-container', 'style', allow_duplicate=True), Output('relate-output-container', 'style', allow_duplicate=True),
-    Input('analysis-type-radio', 'value'),
-    prevent_initial_call=True
-)
-def toggle_controls_and_outputs(analysis_type):
-    desc_style = {'display': 'none', 'marginBottom': 15}; rel_style = {'display': 'none', 'marginBottom': 15}
-    desc_out_style = {'display': 'none'}; rel_out_style = {'display': 'none'}
-    if analysis_type == 'describe_group': desc_style = {'marginBottom': 15}; desc_out_style = {'display': 'block'}
-    elif analysis_type == 'relate': rel_style = {'marginBottom': 15}; rel_out_style = {'display': 'block'}
-    return desc_style, rel_style, desc_out_style, rel_out_style
+# --- 2. 主應用介面 ---
+st.set_page_config(layout="wide", page_title="數位學習樣貌與學業關聯分析")
 
-# --- Callback 2: 動態更新描述性分析的過濾器選項 ---
-@app.callback(
-    Output('variable-filter-multiselect', 'options'), Output('variable-filter-multiselect', 'value'),
-    Input('topic-group-dropdown', 'value'), State('target-selector-radio', 'value')
-)
-def update_variable_filter_options(selected_topic_group_name, selected_target_name):
-    if not selected_topic_group_name or not selected_target_name or selected_target_name not in target_definitions: return [], []
-    target_info = target_definitions[selected_target_name]; current_target_topics = target_info['topics']
-    active_id_map = target_info['id_map_obj']; current_df = globals().get(target_info['df_name'], pd.DataFrame())
-    if selected_topic_group_name not in current_target_topics: return [],[]
-    codes_in_group = current_target_topics[selected_topic_group_name]
-    options = [{'label': f"{active_id_map.get(code, code)} ({code})", 'value': code} for code in codes_in_group if code in active_id_map and active_id_map.get(code,code) in current_df.columns]
-    return options, []
+# 嘗試設定字體，並在側邊欄顯示結果
+try:
+    plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'Arial Unicode MS', 'Microsoft YaHei', 'SimHei', 'PingFang HK', 'Heiti TC', 'sans-serif']
+    plt.rcParams['axes.unicode_minus'] = False
+    st.sidebar.success("Matplotlib 中文字體已嘗試設定。")
+except Exception as e:
+    st.sidebar.error(f"設定 Matplotlib 中文字體時發生錯誤: {e}")
 
-# --- Callback 3: 更新主題/題組描述輸出 ---
-@app.callback(
-    Output('describe-output-container', 'children'),
-    Input('analysis-type-radio', 'value'), Input('topic-group-dropdown', 'value'),
-    Input('variable-filter-multiselect', 'value'), State('target-selector-radio', 'value')
-)
-def update_describe_group_outputs(analysis_type, selected_topic_group_name, selected_variables, selected_target_name):
-    if analysis_type != 'describe_group' or not selected_topic_group_name or not selected_target_name or selected_target_name not in target_definitions:
-        return html.P("請選擇一個研究目標和主題/題組進行描述性分析。")
-    target_info = target_definitions[selected_target_name]; current_target_topics = target_info['topics']
-    current_df = globals().get(target_info['df_name'], pd.DataFrame()); active_id_map = target_info['id_map_obj']; active_value_map = target_info['value_map_obj']
-    if selected_topic_group_name not in current_target_topics: return html.P(f"目標'{selected_target_name}'中無此主題'{selected_topic_group_name}'。")
-    if current_df.empty: return html.Div([html.H4(f"研究目標: {selected_target_name} >> 主題/題組：{selected_topic_group_name}"), html.P(f"錯誤：目標 '{selected_target_name}' 對應的資料表 ({target_info['df_name']}) 未載入或為空。")])
 
-    all_codes_in_group = current_target_topics[selected_topic_group_name]
-    codes_to_display = selected_variables if selected_variables else all_codes_in_group
-    output_elements = [html.H4(f"研究目標: {selected_target_name} >> 主題/題組：{selected_topic_group_name}")]
-    if not codes_to_display: output_elements.append(html.P("此主題/題組下無變項可顯示。")); return output_elements
+st.title("目標一：描繪數位學習樣貌與學業關聯的初步圖像")
+st.markdown(f"""
+本儀表板旨在呈現不同學業成就群體的學生，在各項數位學習行為、素養及學習動機等特徵上的初步畫像。
+主要的分群方式是依據學生「**{grouping_col_name}**」的回答。
+""")
 
-    for code in codes_to_display:
-        if code not in all_codes_in_group: continue
-        col_name = active_id_map.get(code, code)
-        if col_name not in current_df.columns:
-            output_elements.append(html.Div([ html.Hr(), html.P(f"錯誤(描述)：資料({target_info['df_name']})中找不到變項 '{code}'/'{col_name}'。", style={'color': 'red'}) ])); continue
-        df_var_filtered = current_df[~current_df[col_name].isin(values_to_exclude)].copy()
-        if df_var_filtered.empty or df_var_filtered[col_name].dropna().empty:
-            output_elements.append(html.Div([ html.Hr(), html.P(f"子項目: {col_name} ({code}) - 過濾排除值或移除NA後無有效數據。") ])); continue
-        stats_text_list = [f"--- 子項目: {col_name} ({code}) [已排除無效值] ---"]
-        value_counts_abs = df_var_filtered[col_name].value_counts().sort_index(); value_counts_rel = df_var_filtered[col_name].value_counts(normalize=True).sort_index()
-        option_order = get_option_order(code); valid_order = None
-        try:
-            if option_order:
-                 current_index_set = set(value_counts_abs.index); valid_order = [opt for opt in option_order if opt in current_index_set]
-                 if valid_order: value_counts_abs = value_counts_abs.reindex(valid_order, fill_value=0); value_counts_rel = value_counts_rel.reindex(valid_order, fill_value=0)
-        except Exception as e: stats_text_list.append(f"警告：排序時出錯: {e}。")
-        stats_df = pd.DataFrame({'次數': value_counts_abs, '比例': value_counts_rel}); stats_text_list.append("\n次數分佈:"); stats_text_list.append(stats_df.to_string(float_format='{:.1%}'.format))
-        fig = go.Figure()
-        try:
-            fig = px.histogram(df_var_filtered, x=col_name, title=f"分佈：{col_name}", category_orders={col_name: valid_order} if valid_order else None)
-            fig.update_layout(xaxis_title=col_name, yaxis_title="人數", height=300, margin=dict(t=30, b=0)); fig.update_xaxes(type='category')
-        except Exception as e: error_msg = f"錯誤：繪圖時發生錯誤: {e}"; stats_text_list.append(f"\n{error_msg}"); fig.update_layout(title=error_msg)
-        item_div = html.Div([ html.Hr(), html.Pre("\n".join(stats_text_list), style={'whiteSpace': 'pre-wrap', 'fontFamily': 'monospace', 'fontSize': 'small'}), dcc.Graph(figure=fig) ], style={'marginBottom': '20px', 'padding': '10px', 'border': '1px solid #eee'})
-        output_elements.append(item_div)
-    return output_elements
+# 載入並預處理數據
+df_display = load_and_preprocess_data(RAW_STUDENT_DATA_PATH)
 
-# --- Callback 4 & 5: 動態更新 X 和 Y 軸變項下拉選單的選項 ---
-@app.callback(
-    Output('relate-x-dropdown', 'options'), Output('relate-x-dropdown', 'value'),
-    Output('relate-y-dropdown', 'options'), Output('relate-y-dropdown', 'value'),
-    Input('topic-group-dropdown-x', 'value'), Input('topic-group-dropdown-y', 'value'),
-    State('target-selector-radio', 'value')
-)
-def update_relate_variable_options(selected_topic_x, selected_topic_y, selected_target_name):
-    if not selected_target_name or selected_target_name not in target_definitions: return [], None, [], None
-    target_info = target_definitions[selected_target_name]; current_target_topics = target_info['topics']
-    active_id_map = target_info['id_map_obj']; current_df = globals().get(target_info['df_name'], pd.DataFrame())
-    options_x, value_x = ([], None)
-    if selected_topic_x and selected_topic_x in current_target_topics:
-        codes_x = current_target_topics[selected_topic_x]
-        options_x = [{'label': f"{active_id_map.get(code, code)} ({code})", 'value': code} for code in codes_x if code in active_id_map and active_id_map.get(code,code) in current_df.columns]
-        value_x = options_x[0]['value'] if options_x else None
-    options_y, value_y = ([], None)
-    if selected_topic_y and selected_topic_y in current_target_topics:
-        codes_y = current_target_topics[selected_topic_y]
-        options_y = [{'label': f"{active_id_map.get(code, code)} ({code})", 'value': code} for code in codes_y if code in active_id_map and active_id_map.get(code,code) in current_df.columns]
-        value_y = options_y[0]['value'] if options_y else None
-        if options_y and len(options_y) > 1 and value_y == value_x : value_y = options_y[1]['value']
-        elif options_y and value_y == value_x and len(options_y) == 1 : value_y = None
-    return options_x, value_x, options_y, value_y
+if df_display is not None:
+    alpha = 0.05 # 統計檢定顯著水準
 
-# --- Callback 6: 更新雙變項關聯輸出 ---
-@app.callback(
-    Output('plot-output-relate', 'figure'), Output('stats-output-relate', 'children'),
-    Input('analysis-type-radio', 'value'), Input('relate-x-dropdown', 'value'),
-    Input('relate-y-dropdown', 'value'), Input('relate-plot-type', 'value'),
-    State('target-selector-radio', 'value'), State('topic-group-dropdown-x', 'value'), State('topic-group-dropdown-y', 'value'),
-    prevent_initial_call=True
-)
-def update_relate_outputs(analysis_type, x_code, y_code, plot_type, selected_target_name, topic_x_name, topic_y_name):
-    if analysis_type != 'relate' or not x_code or not y_code or not selected_target_name or selected_target_name not in target_definitions:
-        return go.Figure(), "請先選擇研究目標、X/Y 軸主題/題組，然後選擇具體變項。"
-    target_info = target_definitions[selected_target_name]; current_df = globals().get(target_info['df_name'], pd.DataFrame())
-    active_id_map = target_info['id_map_obj']; active_value_map = target_info['value_map_obj']
-    if current_df.empty: return go.Figure(), f"錯誤：目標 '{selected_target_name}' 的資料表 ({target_info['df_name']}) 未載入或為空。"
+   # --- A. 數值型特徵分析與呈現 ---
+    st.header("A. 數值型特徵分析")
+    for num_col in numerical_feature_cols_all:
+        if num_col in df_display.columns:
+            st.subheader(f"特徵：{num_col}")
+            
+            # 描述性統計表格
+            desc_stats = df_display.groupby(grouping_col_name, observed=True)[num_col].agg(
+                ['count', 'mean', 'median', 'std']
+            ).round(2)
+            st.write(f"各「{grouping_col_name}」群組在「{num_col}」上的統計：")
+            st.dataframe(desc_stats)
 
-    x_col = active_id_map.get(x_code, x_code); y_col = active_id_map.get(y_code, y_code)
-    if x_col not in current_df.columns or y_col not in current_df.columns:
-        missing_cols = []
-        if x_col not in current_df.columns: missing_cols.append(f"X軸'{x_col}'({x_code})")
-        if y_col not in current_df.columns: missing_cols.append(f"Y軸'{y_col}'({y_code})")
-        return go.Figure(), f"錯誤(關聯)：資料({target_info['df_name']})中找不到: {', '.join(missing_cols)}。"
-    if x_code == y_code: return go.Figure(), "錯誤：X 軸和 Y 軸不能選擇相同的變項。"
+            # 盒鬚圖
+            fig_num, ax_num = plt.subplots(figsize=(10, 6)) # 創建 fig, ax
+            sns.boxplot(x=grouping_col_name, y=num_col, data=df_display, 
+                        order=grade_order, 
+                        hue=grouping_col_name, # Added to address FutureWarning
+                        palette="viridis", 
+                        ax=ax_num,
+                        legend=False) # Added to address FutureWarning
+            ax_num.set_title(f'不同成績組別在「{num_col}」上的分佈', fontsize=14)
+            ax_num.set_xlabel(grouping_col_name, fontsize=10)
+            ax_num.set_ylabel(f"{num_col} (小時)", fontsize=10) # 假設單位是小時
+            ax_num.tick_params(axis='x', rotation=45, labelsize=8) # Corrected: removed ha='right'
+            ax_num.tick_params(axis='y', labelsize=8)
+            plt.tight_layout()
+            st.pyplot(fig_num)
+            plt.close(fig_num) # 關閉圖表，釋放記憶體
 
-    stats_text_list = [f"===== 雙變項關聯分析 (研究目標: {selected_target_name}) ====="]
-    stats_text_list.append(f"X 軸: {x_col} ({x_code}) [來自: {topic_x_name}]"); stats_text_list.append(f"Y 軸: {y_col} ({y_code}) [來自: {topic_y_name}]")
-    stats_text_list.append(f"圖表類型: {plot_type}"); stats_text_list.append(f"[已排除含無效值的資料列]")
-    fig = go.Figure()
-    df_rel_filtered = current_df[ (~current_df[x_col].isin(values_to_exclude)) & (~current_df[y_col].isin(values_to_exclude)) ].copy()
-    temp_df = df_rel_filtered[[x_col, y_col]].dropna()
-    if temp_df.empty: return go.Figure(), "\n".join(stats_text_list) + "\n錯誤：過濾後無足夠數據。"
+            # 統計檢定
+            st.markdown("**統計檢定結果：**")
+            grouped_data_for_test = [
+                df_display[df_display[grouping_col_name] == group_level][num_col].dropna()
+                for group_level in df_display[grouping_col_name].cat.categories
+            ]
+            grouped_data_for_test = [g for g in grouped_data_for_test if not g.empty]
 
-    try:
-        option_order_x = get_option_order(x_code)
-        option_order_y = get_option_order(y_code)
-        valid_order_x = [opt for opt in option_order_x if opt in temp_df[x_col].unique()] if option_order_x else None
-        valid_order_y = [opt for opt in option_order_y if opt in temp_df[y_col].unique()] if option_order_y else None
+            if len(grouped_data_for_test) >= 2:
+                # ANOVA
+                try:
+                    f_statistic, p_value_anova = stats.f_oneway(*grouped_data_for_test)
+                    st.markdown(f"* **ANOVA 檢定**: F統計量 = {f_statistic:.2f}, p-value = {p_value_anova:.4f}")
+                    if p_value_anova < alpha:
+                        st.markdown(f"    * 結論: **顯著差異** (p < {alpha})。不同成績組別在「{num_col}」上的平均數存在顯著差異。建議進行 post-hoc 檢定。")
+                    else:
+                        st.markdown(f"    * 結論: **無顯著差異** (p >= {alpha})。")
+                except Exception as e:
+                    st.markdown(f"* ANOVA 檢定執行錯誤: {e}")
+                # Kruskal-Wallis
+                try:
+                    h_statistic, p_value_kruskal = stats.kruskal(*grouped_data_for_test)
+                    st.markdown(f"* **Kruskal-Wallis H 檢定**: H統計量 = {h_statistic:.2f}, p-value = {p_value_kruskal:.4f}")
+                    if p_value_kruskal < alpha:
+                        st.markdown(f"    * 結論: **顯著差異** (p < {alpha})。不同成績組別在「{num_col}」上的分佈（中位數）存在顯著差異。建議進行 post-hoc 檢定。")
+                    else:
+                        st.markdown(f"    * 結論: **無顯著差異** (p >= {alpha})。")
+                except Exception as e:
+                    st.markdown(f"* Kruskal-Wallis 檢定執行錯誤: {e}")
+            else:
+                st.markdown("* 有效數據組別少於2組，無法進行 ANOVA 或 Kruskal-Wallis 檢定。")
+            
+            # 文字解讀區塊 (請您填充)
+            st.markdown(f"""
+            **初步文字解讀 ({num_col})**: 
+            * *(例如：從圖表和統計數據看，成績「全班五名以內」的學生在此項目的平均值/中位數為 X，而「全班三十名以後」的為 Y...)*
+            * *(結合p值：ANOVA/Kruskal-Wallis 檢定結果顯示這些差異在統計上是/不是顯著的...)*
+            * *(您的觀察與推論...)*
+            """)
+            st.markdown("---")
+        else:
+            st.warning(f"數值型欄位 {num_col} 未在載入的數據中找到。")
 
-        if plot_type == 'boxplot':
-            # ... (boxplot 邏輯同前) ...
-            stats_text_list.append("\n--- 盒鬚圖分析 ---")
-            score_map_y = get_label_to_score_map(y_code)
-            if not score_map_y: msg = f"錯誤：Y軸'{y_col}'無法轉分數。"; stats_text_list.append(msg); fig.update_layout(title=msg); return fig, "\n".join(stats_text_list)
-            y_score_col = f"{y_code}_score"; temp_df.loc[:, y_score_col] = temp_df[y_col].map(score_map_y)
-            temp_df = temp_df.dropna(subset=[x_col, y_score_col])
-            if temp_df.empty: msg = "錯誤：轉換分數後無數據。"; stats_text_list.append(msg); fig.update_layout(title=msg); return fig, "\n".join(stats_text_list)
-            fig = px.box(temp_df, x=x_col, y=y_score_col, title=f"'{x_col}' 對 '{y_col}' (分數)", category_orders={x_col: valid_order_x} if valid_order_x else None, points=False)
-            fig.update_layout(xaxis_title=f"{x_col}", yaxis_title=f"{y_col} (分數)")
-            stats_text_list.append("\n分組統計 (Y分數):")
-            grouped_stats = temp_df.groupby(x_col)[y_score_col].agg(['mean', 'median', 'std', 'count']).round(2)
-            if valid_order_x: 
-                try: grouped_stats = grouped_stats.reindex(valid_order_x)
-                except Exception: pass
-            stats_text_list.append(grouped_stats.to_string())
+    # --- B. 類別型特徵分析與呈現 ---
+    st.header("B. 類別型特徵分析")
+    palette_idx = 0
+    for cat_col in categorical_feature_cols_all: # 確保此列表已定義
+        if cat_col in df_display.columns:
+            # ... (table display code remains the same) ...
+            st.subheader(f"特徵：{cat_col}")
+            cat_analysis_table = df_display.groupby(grouping_col_name, observed=True)[cat_col].value_counts(
+                normalize=True, dropna=False 
+            ).mul(100).round(2).unstack(fill_value=0)
 
-        elif plot_type == 'heatmap':
-            # ... (heatmap 邏輯同前) ...
-            stats_text_list.append("\n--- 交叉表熱圖 (行百分比) ---")
-            crosstab_rel = pd.crosstab(temp_df[x_col], temp_df[y_col], normalize='index')
-            if valid_order_x: 
-                try: crosstab_rel = crosstab_rel.reindex(index=valid_order_x)
-                except Exception: pass
-            if valid_order_y: 
-                try: crosstab_rel = crosstab_rel.reindex(columns=valid_order_y)
-                except Exception: pass
-            crosstab_rel = crosstab_rel.fillna(0)
-            fig = px.imshow(crosstab_rel, text_auto=".1%", title=f"'{x_col}' vs '{y_col}' (行百分比)", labels=dict(x=y_col, y=x_col, color="比例"), x=crosstab_rel.columns, y=crosstab_rel.index, aspect="auto", color_continuous_scale=px.colors.sequential.Viridis)
-            fig.update_xaxes(side="top"); stats_text_list.append("\n交叉表數據 (行百分比):"); stats_text_list.append(crosstab_rel.round(3).to_string())
+            # --- 新增：轉換 NaN 欄位名稱為字串 ---
+            nan_col_str_representation = "遺失值(NaN)" # 用於代表 NaN 欄位的字串
+            new_column_names = []
+            original_nan_col_name = None # 用於記錄原始的 np.nan (如果存在)
 
-        elif plot_type == 'stackedbar':
-            # ... (stackedbar 邏輯同前) ...
-            stats_text_list.append("\n--- 堆疊長條圖 (次數) ---")
-            crosstab_abs = pd.crosstab(temp_df[x_col], temp_df[y_col])
-            if valid_order_x: 
-                try: crosstab_abs = crosstab_abs.reindex(index=valid_order_x)
-                except Exception: pass
-            if valid_order_y: 
-                try: crosstab_abs = crosstab_abs.reindex(columns=valid_order_y)
-                except Exception: pass
-            crosstab_abs = crosstab_abs.fillna(0)
-            plot_df = crosstab_abs.reset_index().melt(id_vars=x_col, var_name=y_col, value_name='人數')
-            cat_orders = {};
-            if valid_order_x: cat_orders[x_col] = valid_order_x
-            if valid_order_y: cat_orders[y_col] = valid_order_y
-            fig = px.bar(plot_df, x=x_col, y='人數', color=y_col, title=f"'{x_col}' vs '{y_col}' (次數)", category_orders=cat_orders if cat_orders else None, barmode='stack')
-            fig.update_layout(xaxis_title=f"{x_col}", yaxis_title="人數"); stats_text_list.append("\n交叉表數據 (次數):"); stats_text_list.append(crosstab_abs.astype(int).to_string())
+            for col_name in cat_analysis_table.columns:
+                if pd.isna(col_name): # 檢查是否為 np.nan
+                    new_column_names.append(nan_col_str_representation)
+                    original_nan_col_name = col_name # 記下它，方便後續排序
+                else:
+                    new_column_names.append(col_name)
+            cat_analysis_table.columns = new_column_names
+            # --- 轉換結束 ---
+            
+            current_hue_order = category_orders_map.get(cat_col, None) 
+            if current_hue_order is None and isinstance(df_display[cat_col].dtype, pd.CategoricalDtype):
+                 current_hue_order = df_display[cat_col].dtype.categories.tolist()
 
-        else: msg = f"錯誤：未知圖表 '{plot_type}'。" ; stats_text_list.append(msg); fig.update_layout(title=msg)
-    except Exception as e: error_msg = f"錯誤：處理關聯時發生錯誤: {e}"; stats_text_list.append(f"\n{error_msg}"); fig = go.Figure(); fig.update_layout(title=error_msg)
-    return fig, "\n".join(stats_text_list)
+            if current_hue_order:
+                # 根據 current_hue_order 建立基礎的排序列表
+                ordered_columns = [col for col in current_hue_order if col in cat_analysis_table.columns]
+                
+                # 如果原始數據中有 NaN 類別 (現在被轉換為 nan_col_str_representation)
+                # 且這個代表 NaN 的字串欄位存在於表格中，且尚未被加入到 ordered_columns
+                if nan_col_str_representation in cat_analysis_table.columns and \
+                   nan_col_str_representation not in ordered_columns:
+                    ordered_columns.append(nan_col_str_representation)
+                
+                # 確保所有實際存在的欄位都被包含，以防萬一
+                for col_name_in_table in cat_analysis_table.columns:
+                    if col_name_in_table not in ordered_columns:
+                        ordered_columns.append(col_name_in_table)
+                
+                cat_analysis_table = cat_analysis_table[ordered_columns] # 使用最終的欄位列表重新排序
+            
+            st.write(f"各「{grouping_col_name}」群組在「{cat_col}」上的選項百分比 (%)：")
+            st.dataframe(cat_analysis_table) # 現在應該沒問題了
 
-# ==================================================
-# 執行 App
-# ==================================================
-if __name__ == '__main__':
-    print("儀表板準備啟動...")
-    app.run(debug=True)
+            # 分組長條圖
+            plot_data_cat = df_display.groupby(grouping_col_name, observed=True)[cat_col].value_counts(
+                normalize=True 
+            ).mul(100).rename('percentage').reset_index()
+
+            fig_cat, ax_cat = plt.subplots(figsize=(12, 7))
+            sns.barplot(x=grouping_col_name, y='percentage', hue=cat_col, data=plot_data_cat,
+                        order=grade_order, hue_order=current_hue_order, 
+                        palette=palettes_for_categorical[palette_idx % len(palettes_for_categorical)], ax=ax_cat)
+            palette_idx += 1
+            ax_cat.set_title(f'不同成績組別在「{cat_col}」上的選項百分比\n(基於有效回答者)', fontsize=14)
+            ax_cat.set_xlabel(grouping_col_name, fontsize=10)
+            ax_cat.set_ylabel('百分比 (%)', fontsize=10)
+            ax_cat.tick_params(axis='x', rotation=45, labelsize=8) # Corrected: removed ha='right'
+            ax_cat.tick_params(axis='y', labelsize=8)
+            ax_cat.legend(title=cat_col, bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8, title_fontsize='9')
+            plt.tight_layout(rect=[0, 0, 0.85, 1]) 
+            st.pyplot(fig_cat)
+            plt.close(fig_cat)
+
+
+            # 統計檢定
+            st.markdown("**統計檢定結果：**")
+            contingency_table = pd.crosstab(df_display[grouping_col_name], df_display[cat_col])
+            if contingency_table.empty or contingency_table.sum().sum() == 0 or contingency_table.shape[0] < 2 or contingency_table.shape[1] < 2:
+                st.markdown("* 列聯表數據不足，無法進行卡方檢定。")
+            else:
+                try:
+                    chi2, p_value_chi2, dof, expected_freq = stats.chi2_contingency(contingency_table)
+                    st.markdown(f"* **卡方獨立性檢定**: 卡方統計量 = {chi2:.2f}, p-value = {p_value_chi2:.4f}, 自由度 = {dof}")
+                    
+                    min_expected_freq = expected_freq.min()
+                    warning_msg = ""
+                    if min_expected_freq < 1:
+                        warning_msg = f"警告：期望頻率中存在小於1的值 (最小期望頻率: {min_expected_freq:.2f})。"
+                    elif min_expected_freq < 5:
+                        num_cells_lt_5 = (expected_freq < 5).sum()
+                        total_cells = expected_freq.size
+                        if (num_cells_lt_5 / total_cells) > 0.2:
+                            warning_msg = f"警告：超過20%的儲存格期望頻率小於5 (最小期望頻率: {min_expected_freq:.2f})。卡方檢定結果可能不夠準確。"
+                        else:
+                            warning_msg = f"注意：部分儲存格期望頻率小於5 (最小期望頻率: {min_expected_freq:.2f})。"
+                    if warning_msg:
+                        st.markdown(f"    * {warning_msg}")
+
+                    if p_value_chi2 < alpha:
+                        st.markdown(f"    * 結論: **顯著關聯** (p < {alpha})。「{grouping_col_name}」與「{cat_col}」之間存在統計上顯著的關聯。建議分析殘差。")
+                    else:
+                        st.markdown(f"    * 結論: **無顯著關聯** (p >= {alpha})。")
+                except Exception as e:
+                    st.markdown(f"* 卡方檢定執行錯誤: {e}")
+            
+            # 文字解讀區塊 (請您填充)
+            st.markdown(f"""
+            **初步文字解讀 ({cat_col})**:
+            * *(例如：從圖表和統計數據看，成績「全班五名以內」的學生在此項目選擇「很符合」的比例為 X%，而「全班三十名以後」的為 Y%...)*
+            * *(結合p值：卡方檢定結果顯示這些差異在統計上是/不是顯著的...)*
+            * *(您的觀察與推論...)*
+            """)
+            st.markdown("---")
+        else:
+            st.warning(f"類別型欄位 {cat_col} 未在載入的數據中找到。")
+
+    st.header("整體總結與發現")
+    st.markdown("""
+    *(請在此處綜合所有分析結果，撰寫您對「不同成績群體學生在數位學習樣貌上的初步圖像」的總結性看法、主要發現的群體畫像等。)*
+    
+    **例如，您可以從以下幾個角度思考：**
+    * **高學業成就群體特徵**：他們在哪些數位行為、態度或資源擁有上表現出顯著的正面特徵？（例如，更高的自我管理能力、更正面的學習態度、更有效的學習時間分配等）
+    * **中低學業成就群體特徵**：他們在哪些方面可能面臨挑戰或表現出不同的模式？
+    * **普遍現象**：有哪些數位行為或態度在所有學生群體中都比較普遍或比較罕見？
+    * **令人意外的發現**：有哪些結果與您的初步預期不符？
+    * **尚需深入探討的問題**：基於目前的分析，有哪些新的問題或方向值得未來進一步研究？（例如，設備使用頻率的遺失值問題、使用儀表板的複雜模式等）
+    * **對教學實務的可能啟示**：這些發現對於教學設計、學生輔導或資源分配有何初步的啟示？
+    """)
+
+else:
+    st.error("數據未能成功載入或處理，無法顯示儀表板內容。請檢查檔案路徑和數據處理邏輯。")
