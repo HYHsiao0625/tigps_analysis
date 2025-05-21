@@ -244,83 +244,87 @@ if df_display is not None:
     # --- B. 類別型特徵分析與呈現 ---
     st.header("B. 類別型特徵分析")
     palette_idx = 0
+    # nan_col_str_representation = "遺失值(NaN)" # 不再需要這個，因為我們不單獨列出NaN的百分比
+
     for cat_col in categorical_feature_cols_all: # 確保此列表已定義
         if cat_col in df_display.columns:
-            # ... (table display code remains the same) ...
             st.subheader(f"特徵：{cat_col}")
-            cat_analysis_table = df_display.groupby(grouping_col_name, observed=True)[cat_col].value_counts(
-                normalize=True, dropna=False 
-            ).mul(100).round(2).unstack(fill_value=0)
 
-            # --- 新增：轉換 NaN 欄位名稱為字串 ---
-            nan_col_str_representation = "遺失值(NaN)" # 用於代表 NaN 欄位的字串
-            new_column_names = []
-            original_nan_col_name = None # 用於記錄原始的 np.nan (如果存在)
+            # --- 表格數據準備 (修改為 dropna=True 或省略 dropna) ---
+            cat_analysis_table_temp = df_display.groupby(grouping_col_name, observed=True)[cat_col].value_counts(
+                normalize=True # 預設 dropna=True，基於非 NaN 總數計算百分比
+            ).mul(100).round(2).unstack(fill_value=0) # fill_value=0 處理沒有該選項的組別
 
-            for col_name in cat_analysis_table.columns:
-                if pd.isna(col_name): # 檢查是否為 np.nan
-                    new_column_names.append(nan_col_str_representation)
-                    original_nan_col_name = col_name # 記下它，方便後續排序
-                else:
-                    new_column_names.append(col_name)
-            cat_analysis_table.columns = new_column_names
-            # --- 轉換結束 ---
-            
-            current_hue_order = category_orders_map.get(cat_col, None) 
-            if current_hue_order is None and isinstance(df_display[cat_col].dtype, pd.CategoricalDtype):
-                 current_hue_order = df_display[cat_col].dtype.categories.tolist()
+            # 欄位排序邏輯 (現在不需要特別處理 NaN 欄位了)
+            current_order_for_table = category_orders_map.get(cat_col, None)
+            if current_order_for_table is None and isinstance(df_display[cat_col].dtype, pd.CategoricalDtype):
+                 current_order_for_table = df_display[cat_col].dtype.categories.tolist()
 
-            if current_hue_order:
-                # 根據 current_hue_order 建立基礎的排序列表
-                ordered_columns = [col for col in current_hue_order if col in cat_analysis_table.columns]
-                
-                # 如果原始數據中有 NaN 類別 (現在被轉換為 nan_col_str_representation)
-                # 且這個代表 NaN 的字串欄位存在於表格中，且尚未被加入到 ordered_columns
-                if nan_col_str_representation in cat_analysis_table.columns and \
-                   nan_col_str_representation not in ordered_columns:
-                    ordered_columns.append(nan_col_str_representation)
-                
-                # 確保所有實際存在的欄位都被包含，以防萬一
-                for col_name_in_table in cat_analysis_table.columns:
-                    if col_name_in_table not in ordered_columns:
-                        ordered_columns.append(col_name_in_table)
-                
-                cat_analysis_table = cat_analysis_table[ordered_columns] # 使用最終的欄位列表重新排序
-            
-            st.write(f"各「{grouping_col_name}」群組在「{cat_col}」上的選項百分比 (%)：")
-            st.dataframe(cat_analysis_table) # 現在應該沒問題了
+            if current_order_for_table:
+                # 只保留實際存在於表格中的欄位，並按預期順序排列
+                final_ordered_cols_table = [c for c in current_order_for_table if c in cat_analysis_table_temp.columns]
+                # 將任何不在預期順序中但實際存在的欄位附加到末尾
+                for col_name_in_table in cat_analysis_table_temp.columns:
+                    if col_name_in_table not in final_ordered_cols_table:
+                        final_ordered_cols_table.append(col_name_in_table)
+                cat_analysis_table = cat_analysis_table_temp[final_ordered_cols_table]
+            else:
+                cat_analysis_table = cat_analysis_table_temp # 無特定順序時直接使用
 
-            # 分組長條圖
+            st.write(f"各「{grouping_col_name}」群組在「{cat_col}」上的選項百分比 (%) (基於有效回答者)：")
+            st.dataframe(cat_analysis_table)
+
+            # --- 圖表數據準備 (維持原樣，它已經是 dropna=True 的行為) ---
             plot_data_cat = df_display.groupby(grouping_col_name, observed=True)[cat_col].value_counts(
-                normalize=True 
+                normalize=True # 預設 dropna=True
             ).mul(100).rename('percentage').reset_index()
+            
+            # 準備 hue_order 給圖表
+            current_hue_order_for_plot = category_orders_map.get(cat_col, [])
+            if not isinstance(current_hue_order_for_plot, list):
+                 current_hue_order_for_plot = list(current_hue_order_for_plot) if current_hue_order_for_plot else []
+            
+            # 確保 hue_order 中的項目確實存在於 plot_data_cat[cat_col] 中
+            # 並且只使用 plot_data_cat[cat_col] 中實際存在的類別來排序
+            unique_categories_in_plot_data = plot_data_cat[cat_col].unique()
+            
+            # 從預定義順序中篩選出實際存在的類別
+            final_hue_order_for_plot = [cat_val for cat_val in current_hue_order_for_plot if cat_val in unique_categories_in_plot_data]
+            # 添加任何不在預定義順序中但實際存在的類別
+            for cat_val in unique_categories_in_plot_data:
+                if cat_val not in final_hue_order_for_plot:
+                    final_hue_order_for_plot.append(cat_val)
+            
+            if not final_hue_order_for_plot: # 如果上面處理後是空的 (不太可能，但以防萬一)
+                final_hue_order_for_plot = None
+
 
             fig_cat, ax_cat = plt.subplots(figsize=(12, 7))
             sns.barplot(x=grouping_col_name, y='percentage', hue=cat_col, data=plot_data_cat,
-                        order=grade_order, hue_order=current_hue_order, 
+                        order=grade_order, hue_order=final_hue_order_for_plot, 
                         palette=palettes_for_categorical[palette_idx % len(palettes_for_categorical)], ax=ax_cat)
             palette_idx += 1
+            
             ax_cat.set_title(f'不同成績組別在「{cat_col}」上的選項百分比\n(基於有效回答者)', fontsize=14)
             ax_cat.set_xlabel(grouping_col_name, fontsize=10)
             ax_cat.set_ylabel('百分比 (%)', fontsize=10)
-            ax_cat.tick_params(axis='x', rotation=45, labelsize=8) # Corrected: removed ha='right'
+            ax_cat.tick_params(axis='x', rotation=45, labelsize=8)
             ax_cat.tick_params(axis='y', labelsize=8)
             ax_cat.legend(title=cat_col, bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8, title_fontsize='9')
             plt.tight_layout(rect=[0, 0, 0.85, 1]) 
             st.pyplot(fig_cat)
             plt.close(fig_cat)
 
-
-            # 統計檢定
+            # --- 統計檢定部分不變，因為卡方檢定基於原始次數的列聯表 ---
             st.markdown("**統計檢定結果：**")
-            contingency_table = pd.crosstab(df_display[grouping_col_name], df_display[cat_col])
+            contingency_table = pd.crosstab(df_display[grouping_col_name], df_display[cat_col]) # dropna 預設為 True
             if contingency_table.empty or contingency_table.sum().sum() == 0 or contingency_table.shape[0] < 2 or contingency_table.shape[1] < 2:
-                st.markdown("* 列聯表數據不足，無法進行卡方檢定。")
+                st.markdown("* 列聯表數據不足（有效回答過少），無法進行卡方檢定。")
             else:
                 try:
                     chi2, p_value_chi2, dof, expected_freq = stats.chi2_contingency(contingency_table)
                     st.markdown(f"* **卡方獨立性檢定**: 卡方統計量 = {chi2:.2f}, p-value = {p_value_chi2:.4f}, 自由度 = {dof}")
-                    
+                    # ... (期望頻率警告的邏輯不變) ...
                     min_expected_freq = expected_freq.min()
                     warning_msg = ""
                     if min_expected_freq < 1:
@@ -336,17 +340,15 @@ if df_display is not None:
                         st.markdown(f"    * {warning_msg}")
 
                     if p_value_chi2 < alpha:
-                        st.markdown(f"    * 結論: **顯著關聯** (p < {alpha})。「{grouping_col_name}」與「{cat_col}」之間存在統計上顯著的關聯。建議分析殘差。")
+                        st.markdown(f"    * 結論: **顯著關聯** (p < {alpha})。「{grouping_col_name}」與「{cat_col}」之間存在統計上顯著的關聯（基於有效回答）。")
                     else:
-                        st.markdown(f"    * 結論: **無顯著關聯** (p >= {alpha})。")
+                        st.markdown(f"    * 結論: **無顯著關聯** (p >= {alpha})。「{grouping_col_name}」與「{cat_col}」之間不存在統計上顯著的關聯（基於有效回答）。")
                 except Exception as e:
                     st.markdown(f"* 卡方檢定執行錯誤: {e}")
             
-            # 文字解讀區塊 (請您填充)
             st.markdown(f"""
             **初步文字解讀 ({cat_col})**:
-            * *(例如：從圖表和統計數據看，成績「全班五名以內」的學生在此項目選擇「很符合」的比例為 X%，而「全班三十名以後」的為 Y%...)*
-            * *(結合p值：卡方檢定結果顯示這些差異在統計上是/不是顯著的...)*
+            * *(現在表格和圖表的百分比都基於有效回答者，請基於此進行解讀)*
             * *(您的觀察與推論...)*
             """)
             st.markdown("---")
